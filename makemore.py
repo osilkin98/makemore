@@ -500,6 +500,19 @@ def evaluate(model, dataset, batch_size=50, max_batches=None):
     model.train() # reset model back to training mode
     return mean_loss
 
+@torch.no_grad()
+def gradnorm(model: nn.Module) -> float:
+    """
+    Given a PyTorch model, computes the average of the gradnorm across all parameters.
+    """
+    grad_norms = []
+    for p in model.parameters():
+      grad_norms.append(p.grad.norm())
+    if not grad_norms:
+      return 0
+    return sum(grad_norms) / len(grad_norms)
+
+
 # -----------------------------------------------------------------------------
 # helper functions for creating the training and test Datasets that emit words
 
@@ -697,8 +710,10 @@ if __name__ == '__main__':
         if step > 0 and step % 500 == 0:
             train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
             test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
+            grad_norm = gradnorm(model)
             writer.add_scalar("Loss/train", train_loss, step)
             writer.add_scalar("Loss/test", test_loss, step)
+            writer.add_scalar("Gradnorm", grad_norm, step)
             writer.flush()
             print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
             # save the model to disk if it has improved
