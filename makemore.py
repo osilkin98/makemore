@@ -26,6 +26,8 @@ from torch.nn import functional as F
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn import Parameter
+from typing import Iterable
 
 # -----------------------------------------------------------------------------
 
@@ -423,6 +425,92 @@ class Bigram(nn.Module):
         return logits, loss
 
 # -----------------------------------------------------------------------------
+# Base Optimizer Class
+
+class Optimizer:
+  def __init__(self):
+    self.params = []
+
+  def zero_grad(self, set_to_none=True):
+    # we respect `set_to_none` for pytorch compatability
+    for p in self.params:
+      if set_to_none:
+        p.grad = None
+      else:
+        p.grad.data = torch.zeros_like(p.data)
+
+  def step(self):
+    raise NotImplementedError()
+
+# -----------------------------------------------------------------------------
+# Stochastic Gradient Descent
+
+class SGD(Optimizer):
+  def __init__(self, params: List[Parameter], lr=1e-1):
+    super().__init__()
+    self.params = [p for p in params]
+    self.lr = lr
+
+  @torch.no_grad()
+  def step(self):
+    # very simple optimization step
+    for p in self.params:
+      p.data = p.data - self.lr * p.grad.data
+
+# -----------------------------------------------------------------------------
+# SGD With Momentum
+
+class SGDWithMomentum(Optimizer):
+  def __init__(self, params: Iterable[Parameter], lr = 1e-1, momentum = 0.9):
+    super().__init__()
+    self.params = [p for p in params]
+    self.velocity = [torch.zeros_like(p) for p in self.params]
+    self.lr = lr
+    self.momentum = momentum
+
+  @torch.no_grad()
+  def step(self):
+    for i, p in enumerate(self.params):
+      self.velocity[i] = self.momentum * self.velocity[i] - self.lr * p.grad.data
+      p.data = p.data + self.velocity[i]
+
+# -----------------------------------------------------------------------------
+# Nesterov Accelerated Gradient
+
+class NAG(Optimizer):
+  def __init__(self, params: Iterable[Parameter], lr = 0.001, momentum = 0.9):
+    self.params = [p for p in params]
+    self.velocity = [None for _ in self.params]
+    self.lr = lr
+    self.momentum = momentum
+
+  @torch.no_grad()
+  def step(self):
+    for i, p in enumerate(self.params):
+      if self.velocity[i] is None:
+        self.velocity[i] = p.grad.data.clone().detach()
+      else:
+        self.velocity[i] = self.velocity[i] * self.momentum + p.grad.data
+      p.data = p.data - self.lr * (p.grad.data + self.velocity[i] * self.momentum)
+
+# -----------------------------------------------------------------------------
+# Adagrad
+
+class Adagrad(Optimizer):
+  def __init__(self, params: Iterable[Parameter], lr = 1e-3, eps = 1e-8):
+    self.params = [p for p in params]
+    self.grad_noise = [torch.zeros_like(p) for p in self.params]
+    self.lr = lr
+    self.eps = eps
+
+  @torch.no_grad()
+  def step(self):
+    for i, p in enumerate(self.params):
+      # update gradient noise
+      self.grad_noise[i] += p.grad.data ** 2
+      p.data = p.data - self.lr * ((torch.sqrt(self.grad_noise[i]) + self.eps) ** -1) * p.grad.data
+
+# -----------------------------------------------------------------------------
 # helper functions for evaluating and sampling from the model
 
 @torch.no_grad()
@@ -615,7 +703,9 @@ if __name__ == '__main__':
     # optimization
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
+    parser.add_argument('--momentum', '-m', type=float, default=0.9, help="momentum")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
+    parser.add_argument('--optimizer', choices=["sgd", "sgd+momentum", "nag"])
     args = parser.parse_args()
     print(vars(args))
 
@@ -659,7 +749,19 @@ if __name__ == '__main__':
         sys.exit()
 
     # init optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
+    optimizer = None
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
+    match args.optimizer:
+      case "sgd":
+        optimizer = SGD(model.parameters(), lr=args.learning_rate)
+      case "sgd+momentum":
+        optimizer = SGDWithMomentum(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+      case "nag":
+        optimizer = NAG(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
+      case "adagrad":
+        optimizer = Adagrad(model.parameters(), lr=args.learning_rate)
+      case _:
+        raise ValueError(f'invalid optimizer selected: {args.optimizer}')
 
     # init dataloader
     batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
@@ -716,4 +818,3 @@ if __name__ == '__main__':
         # termination conditions
         if args.max_steps >= 0 and step >= args.max_steps:
             break
-
