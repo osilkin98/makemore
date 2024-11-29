@@ -428,88 +428,252 @@ class Bigram(nn.Module):
 # Base Optimizer Class
 
 class Optimizer:
-  def __init__(self):
-    self.params = []
+    def __init__(self):
+        self.params = []
 
-  def zero_grad(self, set_to_none=True):
-    # we respect `set_to_none` for pytorch compatability
-    for p in self.params:
-      if set_to_none:
-        p.grad = None
-      else:
-        p.grad.data = torch.zeros_like(p.data)
+    def zero_grad(self, set_to_none=True):
+        # we respect `set_to_none` for pytorch compatability
+        for p in self.params:
+            if set_to_none:
+                p.grad = None
+            else:
+                p.grad.data = torch.zeros_like(p.data)
 
-  def step(self):
-    raise NotImplementedError()
+    def step(self):
+        raise NotImplementedError()
+
+    @torch.no_grad()
+    def lr_norms(self) -> List[torch.Tensor]:
+        raise NotImplementedError()
+
+# # -----------------------------------------------------------------------------
+# # Stochastic Gradient Descent
+
+# class SGD(Optimizer):
+#   def __init__(self, params: List[Parameter], lr=1e-1):
+#     super().__init__()
+#     self.params = [p for p in params]
+#     self.lr = lr
+
+#   @torch.no_grad()
+#   def step(self):
+#     # very simple optimization step
+#     for p in self.params:
+#       p.data = p.data - self.lr * p.grad.data
+
+# # -----------------------------------------------------------------------------
+# # SGD With Momentum
+
+# class SGDWithMomentum(Optimizer):
+#   def __init__(self, params: Iterable[Parameter], lr = 1e-1, momentum = 0.9):
+#     super().__init__()
+#     self.params = [p for p in params]
+#     self.velocity = [torch.zeros_like(p) for p in self.params]
+#     self.lr = lr
+#     self.momentum = momentum
+
+#   @torch.no_grad()
+#   def step(self):
+#     for i, p in enumerate(self.params):
+#       self.velocity[i] = self.momentum * self.velocity[i] - self.lr * p.grad.data
+#       p.data = p.data + self.velocity[i]
+
+# # -----------------------------------------------------------------------------
+# # Nesterov Accelerated Gradient
+
+# class NAG(Optimizer):
+#   def __init__(self, params: Iterable[Parameter], lr = 0.001, momentum = 0.9):
+#     self.params = [p for p in params]
+#     self.velocity = [None for _ in self.params]
+#     self.lr = lr
+#     self.momentum = momentum
+
+#   @torch.no_grad()
+#   def step(self):
+#     for i, p in enumerate(self.params):
+#       if self.velocity[i] is None:
+#         self.velocity[i] = p.grad.data.clone().detach()
+#       else:
+#         self.velocity[i] = self.velocity[i] * self.momentum + p.grad.data
+#       p.data = p.data - self.lr * (p.grad.data + self.velocity[i] * self.momentum)
 
 # -----------------------------------------------------------------------------
-# Stochastic Gradient Descent
-
-class SGD(Optimizer):
-  def __init__(self, params: List[Parameter], lr=1e-1):
-    super().__init__()
-    self.params = [p for p in params]
-    self.lr = lr
-
-  @torch.no_grad()
-  def step(self):
-    # very simple optimization step
-    for p in self.params:
-      p.data = p.data - self.lr * p.grad.data
-
-# -----------------------------------------------------------------------------
-# SGD With Momentum
-
-class SGDWithMomentum(Optimizer):
-  def __init__(self, params: Iterable[Parameter], lr = 1e-1, momentum = 0.9):
-    super().__init__()
-    self.params = [p for p in params]
-    self.velocity = [torch.zeros_like(p) for p in self.params]
-    self.lr = lr
-    self.momentum = momentum
-
-  @torch.no_grad()
-  def step(self):
-    for i, p in enumerate(self.params):
-      self.velocity[i] = self.momentum * self.velocity[i] - self.lr * p.grad.data
-      p.data = p.data + self.velocity[i]
-
-# -----------------------------------------------------------------------------
-# Nesterov Accelerated Gradient
-
-class NAG(Optimizer):
-  def __init__(self, params: Iterable[Parameter], lr = 0.001, momentum = 0.9):
-    self.params = [p for p in params]
-    self.velocity = [None for _ in self.params]
-    self.lr = lr
-    self.momentum = momentum
-
-  @torch.no_grad()
-  def step(self):
-    for i, p in enumerate(self.params):
-      if self.velocity[i] is None:
-        self.velocity[i] = p.grad.data.clone().detach()
-      else:
-        self.velocity[i] = self.velocity[i] * self.momentum + p.grad.data
-      p.data = p.data - self.lr * (p.grad.data + self.velocity[i] * self.momentum)
-
-# -----------------------------------------------------------------------------
-# Adagrad
+# Adagrad, based on: https://jmlr.org/papers/v12/duchi11a.html
 
 class Adagrad(Optimizer):
-  def __init__(self, params: Iterable[Parameter], lr = 1e-3, eps = 1e-8):
-    self.params = [p for p in params]
-    self.grad_noise = [torch.zeros_like(p) for p in self.params]
-    self.lr = lr
-    self.eps = eps
+    def __init__(self, params: Iterable[Parameter], lr = 1e-3, eps = 1e-8):
+        self.params = [p for p in params]
+        self.grad_noise = [torch.zeros_like(p) for p in self.params]
+        self.lr = lr
+        self.eps = eps
 
-  @torch.no_grad()
-  def step(self):
-    for i, p in enumerate(self.params):
-      # update gradient noise
-      self.grad_noise[i] += p.grad.data ** 2
-      p.data = p.data - self.lr * ((torch.sqrt(self.grad_noise[i]) + self.eps) ** -1) * p.grad.data
+    @torch.no_grad()
+    def step(self):
+        for i, p in enumerate(self.params):
+            # update gradient noise
+            self.grad_noise[i] += p.grad.data ** 2
+            p.data = p.data - self.lr * ((torch.sqrt(self.grad_noise[i]) + self.eps) ** -1) * p.grad.data
 
+    @torch.no_grad()
+    def lr_norms(self) -> List[torch.Tensor]:
+        # collect all of the learning rates
+        norms = []
+        for gn in self.grad_noise:
+            norms.append((self.lr * ((torch.sqrt(gn) + self.eps)**-1)).norm(p=2))
+        return norms
+
+# -----------------------------------------------------------------------------
+# RMSProp, based on: https://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf
+
+class RMSProp(Optimizer):
+    def __init__(self, params: List[Parameter], lr=1e-1, alpha = 0.9, eps = 1e-8):
+        self.params = [p for p in params]
+        self.variance = [torch.zeros_like(p) for p in self.params] 
+        self.lr = lr
+        self.alpha = alpha
+        self.eps = eps
+
+    @torch.no_grad()
+    def step(self):
+        # very simple optimization step
+        for i, p in enumerate(self.params):
+            # compute the uncentered variance
+            self.variance[i] = self.alpha * self.variance[i] + (1 - self.alpha) * (p.grad.data ** 2)
+
+            # scale the learning rate
+            lr = self.lr * ((torch.sqrt(self.variance[i]) + self.eps) ** -1)
+
+            # update!
+            p.data = p.data - lr * p.grad.data
+
+    @torch.no_grad()
+    def lr_norms(self) -> List[torch.Tensor]:
+        norms = []
+        for var in self.variance:
+            lr = self.lr * ((torch.sqrt(var) + self.eps) ** -1) 
+            norms.append(lr.norm(p=2))
+        return norms
+
+# -----------------------------------------------------------------------------
+# Adam optimizer, based on: https://arxiv.org/pdf/1412.6980
+
+class Adam(Optimizer):
+    def __init__(self, params: List[Parameter], lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+        self.lr = lr
+        self.eps = eps
+        self.params = [p for p in params]
+        self.momentum = [torch.zeros_like(p) for p in self.params]
+        self.variance = [torch.zeros_like(p) for p in self.params]
+        
+        # beta values + correction accumulators
+        self.b1, self.b2 = betas
+        self.b1_accum, self.b2_accum = 1, 1
+
+
+    @torch.no_grad()
+    def step(self):
+        # first update the correction accumulators
+        self.b1_accum *= self.b1
+        self.b2_accum *= self.b2
+        for i, p in enumerate(self.params):
+            # update moments
+            self.momentum[i] = self.b1 * self.momentum[i] + (1 - self.b1) * p.grad.data
+            self.variance[i] = self.b2 * self.variance[i] + (1 - self.b2) * (p.grad.data ** 2)
+
+            # correct for bias towards zero
+            momentum_c = self.momentum[i] / (1 - self.b1_accum)
+            variance_c = self.variance[i] / (1 - self.b2_accum)
+
+            # scale the learning rate & update
+            lr = self.lr * ((torch.sqrt(variance_c) + self.eps) ** -1)
+            p.data = p.data - lr * momentum_c
+
+    @torch.no_grad()
+    def lr_norms(self) -> List[torch.Tensor]:
+        assert self.b2_accum != 1, "lr_norms cannot be called before making a step with Adam"
+        norms = []
+        for var in self.variance:
+            corrected = var / (1 - self.b2_accum)
+            lr = self.lr * ((torch.sqrt(corrected) + self.eps) ** -1)
+            norms.append(lr.norm(p=2))
+        return norms
+
+# -----------------------------------------------------------------------------
+# AdamW optimizer, based on: https://arxiv.org/pdf/1711.05101
+
+class AdamW(Optimizer):
+    def __init__(self, params: List[Parameter], lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        self.lr = lr
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.params = [p for p in params]
+        self.momentum = [torch.zeros_like(p) for p in self.params]
+        self.variance = [torch.zeros_like(p) for p in self.params]
+        
+        # beta values + correction accumulators
+        self.b1, self.b2 = betas
+        self.b1_accum, self.b2_accum = 1, 1
+
+    @torch.no_grad()
+    def step(self):
+        # first update the correction accumulators
+        self.b1_accum *= self.b1
+        self.b2_accum *= self.b2
+        for i, p in enumerate(self.params):
+            # perform decay
+            p.data = p.data - self.weight_decay * p.data
+
+            # update moments
+            self.momentum[i] = self.b1 * self.momentum[i] + (1 - self.b1) * p.grad.data
+            self.variance[i] = self.b2 * self.variance[i] + (1 - self.b2) * (p.grad.data ** 2)
+
+            # correct for bias towards zero
+            momentum_c = self.momentum[i] / (1 - self.b1_accum)
+            variance_c = self.variance[i] / (1 - self.b2_accum)
+
+            # scale the learning rate & update
+            lr = self.lr * ((torch.sqrt(variance_c) + self.eps) ** -1)
+            p.data = p.data - lr * momentum_c
+
+    @torch.no_grad()
+    def lr_norms(self) -> List[torch.Tensor]:
+        assert self.b2_accum != 1, "lr_norms cannot be called before making a step with Adam"
+        norms = []
+        for var in self.variance:
+            corrected = var / (1 - self.b2_accum)
+            lr = self.lr * ((torch.sqrt(corrected) + self.eps) ** -1)
+            norms.append(lr.norm(p=2))
+        return norms
+
+
+# -----------------------------------------------------------------------------
+# SGD with momentum and nesterov's accelerated gradient per pytorch implementation
+
+class SGD(Optimizer):
+    def __init__(self, params: List[Parameter], lr=1e-1, momentum: float = 0.0, nesterov = False):
+        self.params = [p for p in params]
+        self.velocity = [None for _ in self.params] 
+        self.lr = lr
+        self.momentum = momentum
+        self.nesterov = nesterov
+
+    @torch.no_grad()
+    def step(self):
+        # very simple optimization step
+        for i, p in enumerate(self.params):
+            grad = p.grad.data 
+            if self.momentum > 0:
+                # will only activate when non-zero momentum was provided
+                if self.velocity[i] is None:
+                    self.velocity[i] = grad.clone().detach()
+                else:
+                    self.velocity[i] = self.momentum * self.velocity[i] + grad
+                grad = self.velocity[i]
+                if self.nesterov:
+                    grad = grad + self.velocity[i] * self.momentum
+                else:
+                    grad = self.velocity[i]
+            p.data = p.data - self.lr * grad
 # -----------------------------------------------------------------------------
 # helper functions for evaluating and sampling from the model
 
@@ -596,9 +760,7 @@ def gradnorm(model: nn.Module) -> float:
     grad_norms = []
     for p in model.parameters():
       grad_norms.append(p.grad.norm())
-    if not grad_norms:
-      return 0
-    return sum(grad_norms) / len(grad_norms)
+    return grad_norms
 
 
 # -----------------------------------------------------------------------------
@@ -716,9 +878,13 @@ if __name__ == '__main__':
     # optimization
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
-    parser.add_argument('--momentum', '-m', type=float, default=0.9, help="momentum")
+    parser.add_argument('--momentum', '-m', type=float, default=0.0, help="momentum")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
-    parser.add_argument('--optimizer', choices=["sgd", "sgd+momentum", "nag"])
+    parser.add_argument('--nesterov', action='store_true', default=False)
+    parser.add_argument('--optimizer', type=str)
+    parser.add_argument('--alpha', type=float, default=0.99, help='The amount by which RMSProp decays its uncentered variance')
+    parser.add_argument('--beta1', type=float, default=0.9, help="Exponential decay term for the first moment estimation in Adam & AdamW")
+    parser.add_argument('--beta2', type=float, default=0.999, help="Exponential decay term for the second moment estimation in Adam & AdamW")
     args = parser.parse_args()
     print(vars(args))
 
@@ -765,16 +931,18 @@ if __name__ == '__main__':
     optimizer = None
     # optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
     match args.optimizer:
-      case "sgd":
-        optimizer = SGD(model.parameters(), lr=args.learning_rate)
-      case "sgd+momentum":
-        optimizer = SGDWithMomentum(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
-      case "nag":
-        optimizer = NAG(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
-      case "adagrad":
-        optimizer = Adagrad(model.parameters(), lr=args.learning_rate)
-      case _:
-        raise ValueError(f'invalid optimizer selected: {args.optimizer}')
+        case "sgd":
+            optimizer = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum, nesterov=args.nesterov)
+        case "adagrad":
+            optimizer = Adagrad(model.parameters(), lr=args.learning_rate)
+        case "rmsprop":
+            optimizer = RMSProp(model.parameters(), lr=args.learning_rate, alpha=args.alpha)
+        case "adam":
+            optimizer = Adam(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2))
+        case "adamw":
+            optimizer = AdamW(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+        case _:
+            raise ValueError(f'invalid optimizer selected: {args.optimizer}')
 
     # init dataloader
     batch_loader = InfiniteDataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, num_workers=args.num_workers)
@@ -812,10 +980,36 @@ if __name__ == '__main__':
         if step > 0 and step % 500 == 0:
             train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
             test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
-            grad_norm = gradnorm(model)
+            gradnorms = gradnorm(model)
+
+            # calculate gradnorm statistics
+            avg_gradnorm = 0 if not gradnorms else sum(gradnorms) / len(gradnorms)
+            max_gradnorm = max(gradnorms)
+            min_gradnorm = min(gradnorms)
+            total_gradnorm = sum(gradnorms)
+
             writer.add_scalar("Loss/train", train_loss, step)
             writer.add_scalar("Loss/test", test_loss, step)
-            writer.add_scalar("Gradnorm", grad_norm, step)
+            writer.add_scalar("Gradnorm/average", avg_gradnorm, step)
+            writer.add_scalar("Gradnorm/max", max_gradnorm, step)
+            writer.add_scalar("Gradnorm/min", min_gradnorm, step)
+            writer.add_scalar("Gradnorm/total", total_gradnorm, step)
+
+            if args.optimizer in ["adagrad", "rmsprop", "adam", "adamw"]:
+                lr_norms = optimizer.lr_norms()
+
+                # calculate learning rate statistics
+                lrnorm_avg = 0 if not lr_norms else sum(lr_norms) / len(lr_norms)
+                lrnorm_max = max(lr_norms)
+                lrnorm_min = min(lr_norms)
+                lrnorm_total = sum(lr_norms)
+
+                writer.add_scalar("LRNorm/average", lrnorm_avg, step)
+                writer.add_scalar("LRNorm/max", lrnorm_max, step)
+                writer.add_scalar("LRNorm/min", lrnorm_min, step)
+                writer.add_scalar("LRNorm/total", lrnorm_total, step)
+
+
             writer.flush()
             print(f"step {step} train loss: {train_loss} test loss: {test_loss}")
             # save the model to disk if it has improved
