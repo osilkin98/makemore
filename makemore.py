@@ -621,7 +621,7 @@ class AdamW(Optimizer):
         self.b2_accum *= self.b2
         for i, p in enumerate(self.params):
             # perform decay
-            p.data = p.data - self.weight_decay * p.data
+            p.data = p.data - self.lr * self.weight_decay * p.data
 
             # update moments
             self.momentum[i] = self.b1 * self.momentum[i] + (1 - self.b1) * p.grad.data
