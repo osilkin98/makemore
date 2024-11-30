@@ -501,7 +501,7 @@ class Optimizer:
 # Adagrad, based on: https://jmlr.org/papers/v12/duchi11a.html
 
 class Adagrad(Optimizer):
-    def __init__(self, params: Iterable[Parameter], lr = 1e-3, eps = 1e-8):
+    def __init__(self, params: Iterable[Parameter], lr = 1e-2, eps = 1e-10):
         self.params = [p for p in params]
         self.grad_noise = [torch.zeros_like(p) for p in self.params]
         self.lr = lr
@@ -527,7 +527,7 @@ class Adagrad(Optimizer):
 # RMSProp, based on: https://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf
 
 class RMSProp(Optimizer):
-    def __init__(self, params: List[Parameter], lr=1e-1, alpha = 0.9, eps = 1e-8):
+    def __init__(self, params: List[Parameter], lr=1e-2, alpha = 0.99, eps = 1e-8):
         self.params = [p for p in params]
         self.variance = [torch.zeros_like(p) for p in self.params] 
         self.lr = lr
