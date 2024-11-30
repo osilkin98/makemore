@@ -512,7 +512,8 @@ class Adagrad(Optimizer):
         for i, p in enumerate(self.params):
             # update gradient noise
             self.grad_noise[i] += p.grad.data ** 2
-            p.data = p.data - self.lr * ((torch.sqrt(self.grad_noise[i]) + self.eps) ** -1) * p.grad.data
+            scaled_lr = self.lr * ((torch.sqrt(self.grad_noise[i]) + self.eps) ** -1)
+            p.data = p.data - scaled_lr * p.grad.data
 
     @torch.no_grad()
     def lr_norms(self) -> List[torch.Tensor]:
@@ -876,12 +877,12 @@ if __name__ == '__main__':
     parser.add_argument('--n-embd', type=int, default=64, help="number of feature channels in the model")
     parser.add_argument('--n-embd2', type=int, default=64, help="number of feature channels elsewhere in the model")
     # optimization
+    parser.add_argument('--optimizer', type=str)
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
     parser.add_argument('--momentum', '-m', type=float, default=0.0, help="momentum")
     parser.add_argument('--weight-decay', '-w', type=float, default=0.01, help="weight decay")
     parser.add_argument('--nesterov', action='store_true', default=False)
-    parser.add_argument('--optimizer', type=str)
     parser.add_argument('--alpha', type=float, default=0.99, help='The amount by which RMSProp decays its uncentered variance')
     parser.add_argument('--beta1', type=float, default=0.9, help="Exponential decay term for the first moment estimation in Adam & AdamW")
     parser.add_argument('--beta2', type=float, default=0.999, help="Exponential decay term for the second moment estimation in Adam & AdamW")
