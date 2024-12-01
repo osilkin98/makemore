@@ -28,6 +28,7 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.nn import Parameter
 from typing import Iterable
+from torch import optim
 
 # -----------------------------------------------------------------------------
 
@@ -527,25 +528,44 @@ class Adagrad(Optimizer):
 # RMSProp, based on: https://www.cs.toronto.edu/~tijmen/csc321/slides/lecture_slides_lec6.pdf
 
 class RMSProp(Optimizer):
-    def __init__(self, params: List[Parameter], lr=1e-2, alpha = 0.99, eps = 1e-8):
+    def __init__(self, params: List[Parameter], lr=1e-2, alpha = 0.99, eps = 1e-8, momentum: float = 0):
         self.params = [p for p in params]
         self.variance = [torch.zeros_like(p) for p in self.params] 
         self.lr = lr
         self.alpha = alpha
         self.eps = eps
+        self.momentum = momentum
+        self.velocity = [None for _ in self.params]
 
     @torch.no_grad()
     def step(self):
         # very simple optimization step
         for i, p in enumerate(self.params):
+            grad = p.grad.data
             # compute the uncentered variance
-            self.variance[i] = self.alpha * self.variance[i] + (1 - self.alpha) * (p.grad.data ** 2)
+            self.variance[i] = self.alpha * self.variance[i] + (1 - self.alpha) * (grad ** 2)
 
-            # scale the learning rate
-            lr = self.lr * ((torch.sqrt(self.variance[i]) + self.eps) ** -1)
+            if self.momentum > 0:
+                # calculation with momentum
+                if self.velocity[i] is None:
+                    self.velocity[i] = torch.zeros_like(p)
 
-            # update!
-            p.data = p.data - lr * p.grad.data
+                # here we scale the learning rate with the momentum + rescaled gradient
+                # scaled_grad = p.grad.data * ((torch.sqrt(self.variance[i]) + self.eps) ** -1)
+                # self.velocity[i] = self.momentum * self.velocity[i] + scaled_grad * (1 - self.momentum)
+
+                grad_term = grad / (torch.sqrt(self.variance[i]) + self.eps)
+                self.velocity[i] = self.momentum * self.velocity[i] + grad_term
+
+                # now the learning rate gets distributed to both the velocity + scaled gradient
+                p.data = p.data - self.lr * self.velocity[i]
+            else:
+                # simple calculation without momentum
+                # step 1: scale the learning rate
+                scaled_lr = self.lr * ((torch.sqrt(self.variance[i]) + self.eps) ** -1)
+
+                # step 2: update!
+                p.data = p.data - scaled_lr * p.grad.data
 
     @torch.no_grad()
     def lr_norms(self) -> List[torch.Tensor]:
@@ -854,6 +874,21 @@ class InfiniteDataLoader:
             batch = next(self.data_iter)
         return batch
 
+
+def get_optimizer(name: str, use_torch: bool):
+    # for debugging against PyTorch optimizers
+    table = {
+        'sgd': (SGD, optim.SGD),
+        'adagrad': (Adagrad, optim.Adagrad),
+        'rmsprop': (RMSProp, optim.RMSprop),
+        'adam': (Adam, optim.Adam),
+        'adamw': (AdamW, optim.AdamW)
+    }
+    if name not in table:
+        raise ValueError(f'invalid optimizer {name}! Must be one of: {table.keys()}')
+    _optim, _torch_optim = table[name]
+    return _torch_optim if use_torch else _optim
+
 # -----------------------------------------------------------------------------
 if __name__ == '__main__':
 
@@ -878,6 +913,7 @@ if __name__ == '__main__':
     parser.add_argument('--n-embd2', type=int, default=64, help="number of feature channels elsewhere in the model")
     # optimization
     parser.add_argument('--optimizer', type=str)
+    parser.add_argument('--use-torch-optim', action='store_true', default=False, help="Use the PyTorch optimizer implementations instead of our own.")
     parser.add_argument('--batch-size', '-b', type=int, default=32, help="batch size during optimization")
     parser.add_argument('--learning-rate', '-l', type=float, default=5e-4, help="learning rate")
     parser.add_argument('--momentum', '-m', type=float, default=0.0, help="momentum")
@@ -929,19 +965,19 @@ if __name__ == '__main__':
         sys.exit()
 
     # init optimizer
-    optimizer = None
+    Optim = get_optimizer(args.optimizer, args.use_torch_optim)
     # optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.99), eps=1e-8)
     match args.optimizer:
         case "sgd":
-            optimizer = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum, nesterov=args.nesterov)
+            optimizer = Optim(params=model.parameters(), lr=args.learning_rate, momentum=args.momentum, nesterov=args.nesterov)
         case "adagrad":
-            optimizer = Adagrad(model.parameters(), lr=args.learning_rate)
+            optimizer = Optim(params=model.parameters(), lr=args.learning_rate)
         case "rmsprop":
-            optimizer = RMSProp(model.parameters(), lr=args.learning_rate, alpha=args.alpha)
+            optimizer = Optim(params=model.parameters(), lr=args.learning_rate, alpha=args.alpha, momentum=args.momentum)
         case "adam":
-            optimizer = Adam(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2))
+            optimizer = Optim(params=model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2))
         case "adamw":
-            optimizer = AdamW(model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
+            optimizer = Optim(params=model.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
         case _:
             raise ValueError(f'invalid optimizer selected: {args.optimizer}')
 
@@ -996,7 +1032,8 @@ if __name__ == '__main__':
             writer.add_scalar("Gradnorm/min", min_gradnorm, step)
             writer.add_scalar("Gradnorm/total", total_gradnorm, step)
 
-            if args.optimizer in ["adagrad", "rmsprop", "adam", "adamw"]:
+            # only our optimizers emit the lr_norm. The torch optimizers do not.
+            if args.optimizer in ["adagrad", "rmsprop", "adam", "adamw"] and not args.use_torch_optim:
                 lr_norms = optimizer.lr_norms()
 
                 # calculate learning rate statistics
