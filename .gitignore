@@ -3,3 +3,4 @@ venv
 # tensorboard dir
 out/
 
+*.pyc

@@ -1,10 +1,11 @@
 from dataclasses import dataclass
+from itertools import chain
 from copy import deepcopy
 import torch
 from torch import nn
 from torch.nn import functional as F
 import math
-from typing import List
+import typing as t
 
 # -----------------------------------------------------------------------------
 
@@ -17,6 +18,20 @@ class ModelConfig:
     n_embd: int = 64
     n_embd2: int = 64
     n_head: int = 4
+
+class KarpathyNNModule(nn.Module):
+    """
+    Just a regular nn.Module but with the added `get_block_size` method.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def get_block_size(self) -> int:
+        raise NotImplementedError()
+
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None) -> t.Tuple[torch.Tensor, t.Optional[torch.Tensor]]:
+        # we just redefine this here since it's common to all of the models Andrej implemented
+        raise NotImplementedError()
 
 # -----------------------------------------------------------------------------
 # Transformer Language Model (*exactly* as used in GPT-2)
@@ -95,7 +110,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class Transformer(nn.Module):
+class Transformer(KarpathyNNModule):
     """ Transformer Language Model, exactly as seen in GPT-2 """
 
     def __init__(self, config):
@@ -187,7 +202,7 @@ class BoWBlock(nn.Module):
         x = x + self.mlpf(x)
         return x
 
-class BoW(nn.Module):
+class BoW(KarpathyNNModule):
     """
     takes the previous block_size tokens, encodes them with a lookup table,
     also encodes their positions with lookup table, then averages all of those
@@ -284,7 +299,7 @@ class GRUCell(nn.Module):
         ht = (1 - z) * hprev + z * hbar
         return ht
 
-class RNN(nn.Module):
+class RNN(KarpathyNNModule):
 
     def __init__(self, config, cell_type):
         super().__init__()
@@ -331,7 +346,7 @@ class RNN(nn.Module):
 # -----------------------------------------------------------------------------
 # MLP language model
 
-class MLP(nn.Module):
+class MLP(KarpathyNNModule):
     """
     takes the previous block_size tokens, encodes them with a lookup table,
     concatenates the vectors and predicts the next token with an MLP.
@@ -380,7 +395,7 @@ class MLP(nn.Module):
 # -----------------------------------------------------------------------------
 # Bigram language model
 
-class Bigram(nn.Module):
+class Bigram(KarpathyNNModule):
     """
     Bigram Language Model 'neural net', simply a lookup table of logits for the
     next character given a previous character.
@@ -407,25 +422,40 @@ class Bigram(nn.Module):
         return logits, loss
 
 
+# -----------------------------------------------------------------------------
+# Bigram language model
 
-class DataParallel(nn.Module):
+class DataParallel(KarpathyNNModule):
     """
     Extremely simple and janky DataParallel implementation.
     """
-    def __init__(self, model: nn.Module, device_ids: List[int] = None):
+    def __init__(self, model: KarpathyNNModule, device_ids: t.List[int] = None):
         super().__init__()
+        # maybe a bit of overthinking but this is how we gate against non-supported configurations
+        model_device_types = {p.device.type for p in chain(model.parameters(), model.buffers())}
+        if len(model_device_types) > 1:
+            raise ValueError("DataParallel does not support models using multiple devices!")
+        device_type = model_device_types.pop()
+        supported_devices = ["cuda", "cpu"]
+        if device_type not in supported_devices:
+            raise ValueError(f"DataParallel does not support device type: {device_type}")
+
         if not device_ids:
-            device = torch.device("cpu")
-            device_ids = [device]
+            if device_type == "cpu":
+                device = torch.device("cpu")
+                device_ids = [device]
+            else:
+                print('dataparallel: no device_ids were specified, using all of your GPUs')
+                device_ids = [i for i in range(torch.cuda.device_count())]
 
         self.device_ids = device_ids
-        self.model: nn.Module = model
+        self.module: nn.Module = model
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor=None):
         # base case, do nothing
         if len(self.device_ids) == 1:
-            self.model.to(self.device_ids[0])
-            return self.model(idx, targets=targets)
+            self.module.to(self.device_ids[0])
+            return self.module(idx, targets=targets)
 
         # first we must split up the input
         num_replicas = len(self.device_ids)
@@ -433,35 +463,44 @@ class DataParallel(nn.Module):
         split_size = B // num_replicas
 
         # replicate the model on each device
-        self.model = self.model.to(self.device_ids[0])
-        replicas = [self.model]
+        self.module = self.module.to(self.device_ids[0])
+        replicas = [self.module]
         for device_id in self.device_ids[1:]:
             # TODO: find a better way to do this
-            replica = deepcopy(self.model)
-            replica.load_state_dict(self.model.state_dict())
+            replica = deepcopy(self.module)
+            replica.load_state_dict(self.module.state_dict())
             replica = replica.to(device_id)
             replicas.append(replica)
 
         # this part is highly inefficient as we have to keep copying the input i think
         idx_device_chunks = [chunk.to(device) for chunk, device in zip(torch.split(idx, split_size, dim=0), self.device_ids)]
-        targets_device_chunks = [chunk.to(device) for chunk, device in zip(torch.split(targets, split_size, dim=0), self.device_ids)]
+        targets_device_chunks = [None for _ in idx_device_chunks]
+        if targets is not None:
+            targets_device_chunks = [chunk.to(device) for chunk, device in zip(torch.split(targets, split_size, dim=0), self.device_ids)]
 
         outputs = []
-        for replica, idx, targets in zip(replicas, idx_device_chunks, targets_device_chunks):
+        for replica, idx_shard, targets_shard in zip(replicas, idx_device_chunks, targets_device_chunks):
             replica_device = next(p for p in replica.parameters()).device
-            assert replica_device == idx.device, f"inputs and replica must be on the same device! {replica_device} != {idx.device}"
-            assert replica_device == targets.device, f"targets and replica must be on the same device! {replica_device} != {targets.device}"
+            assert replica_device == idx_shard.device, f"inputs and replica must be on the same device! {replica_device} != {idx_shard.device}"
+            if targets_shard is not None:
+                assert replica_device == targets_shard.device, f"targets and replica must be on the same device! {replica_device} != {targets_shard.device}"
 
             # we assume the model's return type here
-            logits, loss = replica(idx, targets)
+            logits, loss = replica(idx_shard, targets_shard)
 
             # send everything back to the first device
-            logits, loss = logits.to(self.device_ids[0]), loss.to(self.device_ids[0])
+            logits = logits.to(self.device_ids[0])
+            loss = None if loss is None else loss.to(self.device_ids[0])
 
             outputs.append((logits, loss))
 
         # send everything back to the first device and prepare for return
         logits = torch.cat([logit_chunk for logit_chunk, _ in outputs])
-        total_loss = torch.stack([loss for _, loss in outputs]).sum(dim=0, keepdim=False)
-        total_loss *= split_size / (B)
+        total_loss = None
+        if targets is not None:
+            total_loss = torch.stack([loss for _, loss in outputs]).sum(dim=0, keepdim=False)
+            total_loss *= split_size / (B)
         return logits, total_loss
+
+    def get_block_size(self):
+        return self.module.get_block_size()
