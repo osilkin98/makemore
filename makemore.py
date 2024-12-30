@@ -12,6 +12,7 @@ Changes from minGPT:
   difference at the scale that we operate on here.
 """
 
+from copy import deepcopy
 import os
 import sys
 import time
@@ -97,6 +98,17 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class TransformerMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.act = NewGELU()
+
+    def forward(self, x: torch.Tensor):
+        return self.c_proj(self.act(self.c_fc(x)))
+
+
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
@@ -105,17 +117,11 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = nn.ModuleDict(dict(
-            c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
-            c_proj  = nn.Linear(4 * config.n_embd, config.n_embd),
-            act     = NewGELU(),
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.c_proj(m.act(m.c_fc(x))) # MLP forward
+        self.mlp = TransformerMLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlpf(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 class Transformer(nn.Module):
@@ -632,8 +638,8 @@ class AdamW(Optimizer):
         self.eps = eps
         self.weight_decay = weight_decay
         self.params = [p for p in params]
-        self.momentum = [torch.zeros_like(p) for p in self.params]
-        self.variance = [torch.zeros_like(p) for p in self.params]
+        self.momentum = [None for _ in self.params]
+        self.variance = [None for _ in self.params]
         
         # beta values + correction accumulators
         self.b1, self.b2 = betas
@@ -647,6 +653,11 @@ class AdamW(Optimizer):
         for i, p in enumerate(self.params):
             # perform decay
             p.data = p.data - self.lr * self.weight_decay * p.data
+
+            if self.momentum[i] is None:
+                self.momentum[i] = torch.zeros_like(p.data)
+                self.variance[i] = torch.zeros_like(p.data)
+
 
             # update moments
             self.momentum[i] = self.b1 * self.momentum[i] + (1 - self.b1) * p.grad.data
@@ -733,7 +744,7 @@ def generate(model, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k
 
     return idx
 
-def print_samples(num=10):
+def print_samples(args, model, train_dataset, test_dataset, num=10):
     """ samples from the model and pretty prints the decoded samples """
     X_init = torch.zeros(num, 1, dtype=torch.long).to(args.device)
     top_k = args.top_k if args.top_k != -1 else None
@@ -762,7 +773,7 @@ def print_samples(num=10):
     print('-'*80)
 
 @torch.inference_mode()
-def evaluate(model, dataset, batch_size=50, max_batches=None):
+def evaluate(model, dataset, args, batch_size=50, max_batches=None):
     model.eval()
     loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=0)
     losses = []
@@ -926,8 +937,8 @@ def train(args, model: nn.Module, optimizer: Optimizer, batch_loader: InfiniteDa
         # evaluate the model
         test_loss, train_loss = None, None
         if step > 0 and step % 500 == 0:
-            train_loss = evaluate(model, train_dataset, batch_size=100, max_batches=10)
-            test_loss  = evaluate(model, test_dataset,  batch_size=100, max_batches=10)
+            train_loss = evaluate(model, train_dataset, args, batch_size=100, max_batches=10)
+            test_loss  = evaluate(model, test_dataset, args,  batch_size=100, max_batches=10)
             gradnorms = gradnorm(model)
 
             # calculate gradnorm statistics
@@ -1006,7 +1017,7 @@ def train(args, model: nn.Module, optimizer: Optimizer, batch_loader: InfiniteDa
 
         # sample from the model
         if step > 0 and step % 200 == 0:
-            print_samples(num=10)
+            print_samples(args, model, train_dataset, test_dataset, num=10)
 
         step += 1
         # termination conditions
@@ -1288,61 +1299,9 @@ def mp_forward_pass(i, queue: mp.Queue, model, batch, total_batch_size: int):
         print(f'loss: {loss.item()}')
 
 
-
-"""
-
-model = InitialModel()
-
-model = DataParallel(model)
-
-inputs -> DataParallel( ==> model ) -> outputs  --> loss
-dinputs <-- dmodel         <-- ddp <- doutputs  <-- loss.backward()
-
-
-
-"""
-
-
 class DataParallel(nn.Module):
     """
-    
-    DataParallel must work like this:
-    1. In the most basic case of no GPUs, there is only one model and it runs on the CPU just as the regular model would. Batch size is the same as global
-    2. In the case of 1 GPU, the model runs on the single GPU and does not need to replicate itself. Batch size is the same as global
-    3. In the case of 2 GPUs:
-        a. the model is replicated on GPU 0 and 1.
-        b. The batch size is halved. One half runs on GPU 0 and another on GPU 1
-        c. After the forward pass is completed, the results are returned from forward
-        d. Some time later, we expect .backward() to be called and the gradients will backpropagate through the wrapped model
-            When this happens, we must sum up the gradients on the original model (primary replica)
-
-            
-    Something important to note here is that when we have control over the loss calculation then we can simply rescale the loss
-    according to what the total batch was. But since we can't make this assumption since models may have an arbitrary return signature,
-    we must find an alternative way to ensure that the gradients on the primary model are correct.
-    
-
-    We also know one other things, which is that when we have an input like X = [x1, x2, x3, x4] then what happens is it goes into the model like:
-
-    out = model(X)
-        = model([X1, X2, X3, X4])
-        = model0(X1) | model1(X2) | model2(X3) | model3(X4)
-        = out1       | out2       | out3       | out4
-        = [out1, out2, out3, out4]
-
-    So then if we have that 
-
-    loss = Softmax(out)
-    then 
-    dloss = 1
-    dout = dloss * (deriv[softmax])
-    out <---- [dout1,      dout2,      dout3,      dout4     ]
-    out <---- [model1(x1), model2(x2), model3(x3), model4(x4)]
-
-    dx1 <-- dmodel1 
-
-    Let's instead assume that our DataParallel implementation can accept the specific signature that we've defined above of idx, targets and returns logits, loss
-
+    Extremely simple and janky DataParallel implementation.
     """
     def __init__(self, model: nn.Module, device_ids: List[int] = None):
         super().__init__()
@@ -1352,69 +1311,51 @@ class DataParallel(nn.Module):
 
         self.device_ids = device_ids
         self.model: nn.Module = model
-        self.replicas: List[nn.Module] = []
-        for device_id in self.device_ids:
-            replica = self.model.to(device_id)
-            self.replicas.append(replica)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor=None):
-        num_replicas = len(self.replicas)
-        if num_replicas == 1:
-            # do nothing for now
-            model = self.replicas[0]
-            return model(idx, targets)
+        # base case, do nothing
+        if len(self.device_ids) == 1:
+            self.model.to(self.device_ids[0])
+            return self.model(idx, targets=targets)
 
         # first we must split up the input
+        num_replicas = len(self.device_ids)
         B = idx.shape[0]
         split_size = B // num_replicas
+
+        # replicate the model on each device
+        self.model = self.model.to(self.device_ids[0])
+        replicas = [self.model]
+        for device_id in self.device_ids[1:]:
+            # TODO: find a better way to do this
+            replica = deepcopy(self.model)
+            replica.load_state_dict(self.model.state_dict())
+            replica = replica.to(device_id)
+            replicas.append(replica)
 
         # this part is highly inefficient as we have to keep copying the input i think
         idx_device_chunks = [chunk.to(device) for chunk, device in zip(torch.split(idx, split_size, dim=0), self.device_ids)]
         targets_device_chunks = [chunk.to(device) for chunk, device in zip(torch.split(targets, split_size, dim=0), self.device_ids)]
 
         outputs = []
-        for replica, idx, targets in zip(self.replicas, idx_device_chunks, targets_device_chunks):
+        for replica, idx, targets in zip(replicas, idx_device_chunks, targets_device_chunks):
             replica_device = next(p for p in replica.parameters()).device
             assert replica_device == idx.device, f"inputs and replica must be on the same device! {replica_device} != {idx.device}"
             assert replica_device == targets.device, f"targets and replica must be on the same device! {replica_device} != {targets.device}"
 
             # we assume the model's return type here
             logits, loss = replica(idx, targets)
+
+            # send everything back to the first device
+            logits, loss = logits.to(self.device_ids[0]), loss.to(self.device_ids[0])
+
             outputs.append((logits, loss))
 
-        # prepare to be outputted
+        # send everything back to the first device and prepare for return
         logits = torch.cat([logit_chunk for logit_chunk, _ in outputs])
-        total_loss = torch.stack([loss for _, loss in outputs]).sum(keepdim=False)
-        total_loss *= split_size / (B  * num_replicas)
+        total_loss = torch.stack([loss for _, loss in outputs]).sum(dim=0, keepdim=False)
+        total_loss *= split_size / (B)
         return logits, total_loss
-
-        """
-        L_1 = 1/20 (S_1)
-        L_2 = 1/20 (S_2)
-
-        but if it was done combined, it would be loss: L_t = 1/40 (S_1 + S_2)
-        
-        We want to find a way to recover L_t from L_1 and L_2
-
-        1/20 S_1 + 1/20 S_2 = 2/20 S_2 * x = 1/40 (S_1 + S_1)
-        = 2/20 (S_1 + S_2) * x = 1/40 (S_1 + S_2)
-        = 2/20 * x = 1/40
-        => N/Bn * x = 1/B
-        => x = Bn * 1/B * 1/N
-
-        And we have that
-        [B = 40, N = 2, Bn = 20]
-
-        (1/20 S_1 + 1/20 S_2 ) * x
-        = (1/20 + 1/20) (S_1 + S_2) * x
-        = 2/20 * (S_1 + S_2) * x 
-        = 2/20 * (S_1 + S_2) * (20 * 1/40 * 1/2)
-        = 2/20 * (S_1 + S_2) * 20 * 1/40 * 1/2
-        = 2 * 1/20 * (S_1 + S_2) * 20 * 1/40 * 1/2
-        = 1/20 * (S_1 + S_2) * 20 * 1/40 
-        = (S_1 + S_2) * 1/40 
-        """
-
         
 
 
@@ -1437,23 +1378,27 @@ def run_better_dataparallel(args):
 
     # setup model copy
     model = setup_model(args.type, config, args.device, args.work_dir, args.resume, args.sample_only)
-    model = DataParallel(model)
+    model = DataParallel(model, device_ids=[0, 1, 2, 3])
+    optimizer = AdamW(model.parameters())
+    # optimizer = SGD(model.parameters(), momentum=0.9)
     
-    n_epochs = 10
+    n_epochs = 1000
     for n in range(n_epochs):
         # zero gradients
-        for p in model.parameters():
-            p.grad = None
+        # for p in model.parameters():
+        #     p.grad = None
+        optimizer.zero_grad()
 
         inputs, targets = loader.next()
         logits, loss = model(inputs, targets)
         
-        print(f"{n}: {loss.item()}")
+        if n % 100 == 0:
+            print(f"{n}: {loss.item():.4f}")
         loss.backward()
-        lr = 1e-2
-        with torch.no_grad():
-            for p in model.parameters():
-                p.data -= lr * p.grad.data
+        optimizer.step()
+        # with torch.no_grad():
+        #     for p in model.parameters():
+        #         p.data -= lr * p.grad.data
 
 
 
@@ -1603,7 +1548,7 @@ def example_dp_train():
     )
 
     if args.sample_only:
-        print_samples(num=50)
+        print_samples(args=args, model=model, train_dataset=train_dataset, test_dataset=test_dataset, num=50)
         sys.exit()
 
     optimizer = setup_optimizer(args, model)
@@ -1614,6 +1559,7 @@ def example_dp_train():
 
 
     train(
+        args,
         model=model,
         optimizer=optimizer,
         batch_loader=batch_loader,
@@ -1654,7 +1600,7 @@ def main():
     model = nn.DataParallel(model)
 
     if args.sample_only:
-        print_samples(num=50)
+        print_samples(args=args, model=model, train_dataset=train_dataset, test_dataset=test_dataset, num=50)
         sys.exit()
 
     optimizer = setup_optimizer(args, model)
